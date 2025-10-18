@@ -1,0 +1,138 @@
+name: Ubuntu 22.04 SSH
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-ssh:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure SSH Settings
+        run: |
+          # 确保 SSH 服务已启动
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          
+          # 配置 SSH 允许密码认证（用于测试）
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+          
+          # 重启 SSH 服务使配置生效
+          sudo systemctl restart ssh
+
+      - name: Create SSH User with Secure Password
+        run: |
+          # 生成安全的随机密码
+          PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-20)
+          
+          # 创建用户并设置密码
+          sudo useradd -m -s /bin/bash -G sudo sshuser
+          echo "sshuser:$PASSWORD" | sudo chpasswd
+          
+          # 保存凭据到环境变量
+          echo "SSH_CREDS=User: sshuser | Password: $PASSWORD" >> $GITHUB_ENV
+          echo "SSH_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+          
+          # 验证用户创建成功
+          if ! id sshuser &>/dev/null; then
+              echo "用户创建失败"
+              exit 1
+          fi
+          
+          echo "SSH 用户创建成功"
+
+      - name: Configure Firewall and Open Ports
+        run: |
+          # 安装 iptables-persistent 以保存防火墙规则
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+          
+          # 开放常用端口
+          sudo iptables -I INPUT -p tcp --dport 22 -j ACCEPT    # SSH
+          sudo iptables -I INPUT -p tcp --dport 8080 -j ACCEPT  # HTTP Alt
+          sudo iptables -I INPUT -p udp --dport 8080 -j ACCEPT  # HTTP Alt UDP
+          sudo iptables -I INPUT -p tcp --dport 8388 -j ACCEPT  # Shadowsocks
+          sudo iptables -I INPUT -p udp --dport 8388 -j ACCEPT  # Shadowsocks UDP
+          sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT   # HTTPS
+          sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT    # HTTP
+          
+          # 保存 iptables 规则
+          sudo netfilter-persistent save
+          
+          # 显示已开放的端口
+          echo "已开放的端口："
+          sudo iptables -L INPUT -n --line-numbers | grep ACCEPT | grep dpt:
+          
+          echo "防火墙配置完成"
+
+      - name: Install Tailscale
+        run: |
+          # 添加 Tailscale 的包签名密钥和仓库（基于官方文档）
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          
+          # 更新包列表并安装 Tailscale
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+          
+          echo "Tailscale 安装完成"
+
+      - name: Establish Tailscale Connection
+        run: |
+          # 使用认证密钥连接到 Tailscale 网络
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ubuntu-${{ github.run_id }}
+          
+          # 等待 Tailscale 分配 IP 地址
+          retries=0
+          while [ $retries -lt 10 ]; do
+              TAILSCALE_IP=$(tailscale ip -4 2>/dev/null)
+              if [ -n "$TAILSCALE_IP" ]; then
+                  echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+                  echo "Tailscale IP: $TAILSCALE_IP"
+                  break
+              fi
+              sleep 5
+              retries=$((retries + 1))
+          done
+          
+          if [ -z "$TAILSCALE_IP" ]; then
+              echo "Tailscale IP 未分配，退出"
+              exit 1
+          fi
+      
+      - name: Verify SSH Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          
+          # 检查 SSH 服务是否在监听
+          if sudo netstat -tuln | grep -q ':22 '; then
+              echo "SSH 服务正在监听端口 22"
+          else
+              echo "SSH 服务未在端口 22 上监听"
+              exit 1
+          fi
+          
+          # 显示 Tailscale 状态
+          tailscale status
+          
+          echo "SSH 连接验证成功！"
+
+      - name: Display Connection Info and Maintain
+        run: |
+          echo ""
+          echo "=== SSH 访问信息 ==="
+          echo "地址: $TAILSCALE_IP"
+          echo "端口: 22"
+          echo "用户名: sshuser"
+          echo "密码: $SSH_PASSWORD"
+          echo "===================="
+          echo ""
+          echo "连接命令: ssh sshuser@$TAILSCALE_IP"
+          echo ""
+          
+          # 保持运行器活跃（直到手动取消）
+          while true; do
+              echo "[$(date)] SSH 服务运行中 - 在工作流中使用 Ctrl+C 终止"
+              sleep 300
+          done
